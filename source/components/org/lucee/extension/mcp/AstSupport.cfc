@@ -11,12 +11,39 @@ component {
 		return "AST parsing requires Lucee 7.0.0.296 or later (astFromString / astFromPath).";
 	}
 
+	/**
+	 * the "path" argument (parse a file from the server's file system) is disabled by default.
+	 * Enable it with the system property "lucee.mcp.ast.allowpath" or the environment variable
+	 * "LUCEE_MCP_AST_ALLOWPATH" set to true, e.g. for a local MCP server.
+	 */
+	boolean function isPathAllowed() {
+		var sys = createObject( "java", "java.lang.System" );
+		var raw = sys.getProperty( "lucee.mcp.ast.allowpath" )
+		       ?: sys.getenv( "LUCEE_MCP_AST_ALLOWPATH" )
+		       ?: "";
+		raw = trim( raw );
+		return isBoolean( raw ) && raw;
+	}
+
+	/**
+	 * removes the "path" argument from a tool input schema when it is not enabled
+	 */
+	struct function adjustInputSchema( required struct inputSchema ) {
+		if ( isPathAllowed() ) return inputSchema;
+		var schema = duplicate( inputSchema );
+		structDelete( schema.properties, "path" );
+		return schema;
+	}
+
 	function parse( required struct opts ) {
 		if ( structKeyExists( opts, "path" ) && len( trim( opts.path ) ) ) {
+			if ( !isPathAllowed() ) {
+				cfthrow( message: "the path argument is not enabled on this server, pass the CFML code as source" );
+			}
 			return astFromPath( trim( opts.path ) );
 		}
 		if ( !structKeyExists( opts, "source" ) || isEmpty( trim( opts.source ) ) ) {
-			cfthrow( message: "source or path is required" );
+			cfthrow( message: isPathAllowed() ? "source or path is required" : "source is required" );
 		}
 		return astFromString( trim( opts.source ), opts.mode ?: "tag" );
 	}

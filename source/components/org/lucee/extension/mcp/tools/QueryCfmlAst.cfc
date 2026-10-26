@@ -19,7 +19,7 @@ component extends="Tool" {
 			},
 			"path": {
 				"type"       : "string",
-				"description": "Alternative to source: path to a .cfm/.cfc/.cfml file"
+				"description": "Alternative to source: path to a .cfm/.cfc/.cfml file on the server. Only available when enabled on the server"
 			},
 			"mode": {
 				"type"       : "string",
@@ -49,6 +49,8 @@ component extends="Tool" {
 
 	public function init() {
 		variables.astSupport = createObject( "component", "org.lucee.extension.mcp.AstSupport" );
+		// "path" is only offered when it is enabled on this server
+		variables.inputSchema = variables.astSupport.adjustInputSchema( variables.inputSchema );
 		return this;
 	}
 
@@ -61,7 +63,7 @@ component extends="Tool" {
 		var hasPath   = structKeyExists( args, "path" ) && len( trim( args.path ) );
 
 		if ( !hasSource && !hasPath ) {
-			cfthrow( message: "source or path is required" );
+			cfthrow( message: variables.astSupport.isPathAllowed() ? "source or path is required" : "source is required" );
 		}
 
 		var ast = variables.astSupport.parse( args );
