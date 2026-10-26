@@ -22,6 +22,25 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="mcpserver" {
         variables.tool = createObject( "component", "org.lucee.extension.mcp.tools.QueryCfmlAst" );
         variables.tool.init();
         variables.astSupported = structKeyExists( getFunctionList(), "astFromString" );
+        variables.system = createObject( "java", "java.lang.System" );
+        variables.allowPathProp = "lucee.mcp.ast.allowpath";
+        variables.allowPathOrg = system.getProperty( allowPathProp );
+        variables.astFile = getTempFile( getTempDirectory(), "mcp-ast-test", "cfm" );
+        fileWrite( astFile, '<cfloop from="1" to="10" index="i"></cfloop>' );
+    }
+
+    function afterAll() {
+        restoreAllowPath();
+        if ( fileExists( astFile ) ) fileDelete( astFile );
+    }
+
+    private function restoreAllowPath() {
+        if ( isNull( allowPathOrg ) ) system.clearProperty( allowPathProp );
+        else system.setProperty( allowPathProp, allowPathOrg );
+    }
+
+    private function newTool() {
+        return createObject( "component", "org.lucee.extension.mcp.tools.QueryCfmlAst" ).init();
     }
 
     function run( testResults, testBox ) {
@@ -42,6 +61,35 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="mcpserver" {
                 expect( structKeyExists( schema.properties, "nodeType" ) ).toBeTrue();
                 expect( structKeyExists( schema.properties, "name" ) ).toBeTrue();
                 expect( structKeyExists( schema.properties, "builtInOnly" ) ).toBeTrue();
+            });
+
+            it( "path argument is rejected when disabled", function() {
+                system.setProperty( allowPathProp, "false" );
+                try {
+                    var t = newTool();
+                    expect( structKeyExists( t.getInputSchema().properties, "path" ) ).toBeFalse();
+                    expect( function() {
+                        t.exec( { path: astFile, nodeType: "CFMLTag" } );
+                    } ).toThrow( regex: "path argument is not enabled" );
+                }
+                finally {
+                    restoreAllowPath();
+                }
+            });
+
+            it( "path argument works when enabled", function() {
+                system.setProperty( allowPathProp, "true" );
+                try {
+                    var t = newTool();
+                    expect( structKeyExists( t.getInputSchema().properties, "path" ) ).toBeTrue();
+                    if ( astSupported ) {
+                        var data = deserializeJSON( t.exec( { path: astFile, nodeType: "CFMLTag", name: "loop" } ).content[1].text );
+                        expect( data.matchCount ).toBeGT( 0 );
+                    }
+                }
+                finally {
+                    restoreAllowPath();
+                }
             });
 
             it( "missing source and path returns error", function() {

@@ -23,12 +23,14 @@ Beyond its use as a Lucee documentation tool, this extension is designed to serv
 | `get_lucee_function` | Full descriptor for a named Lucee built-in function — arguments, types, defaults, and docs URL |
 | `get_lucee_tag` | Full descriptor for a named Lucee tag — attributes, types, defaults, and docs URL |
 | `search_lucee_docs` | Full-text search across functions, tags, and recipes. **Requires the Lucene 3 extension**; returns a graceful message if Lucene is not installed |
-| `parse_cfml_ast` | Parse CFML source or a file path into an AST JSON tree or compact summary. **Requires Lucee 7.0.0.296+** (`astFromString` / `astFromPath`) |
+| `parse_cfml_ast` | Parse CFML source (or a file path, if enabled) into an AST JSON tree or compact summary. **Requires Lucee 7.0.0.296+** (`astFromString` / `astFromPath`) |
 | `query_cfml_ast` | Find AST nodes by type, name, line, or built-in status in parsed CFML. **Requires Lucee 7.0.0.296+** |
 
 ### AST tools
 
-`parse_cfml_ast` and `query_cfml_ast` use Lucee 7's built-in AST functions. Pass either `source` (inline CFML) or `path` (`.cfm` / `.cfc` / `.cfml` file). Optional `mode` is `tag` (default) or `script`.
+`parse_cfml_ast` and `query_cfml_ast` use Lucee 7's built-in AST functions. Pass `source` (inline CFML), or `path` (`.cfm` / `.cfc` / `.cfml` file on the server) if enabled. Optional `mode` is `tag` (default) or `script`.
+
+The `path` argument is disabled by default, so the tools only parse the code passed to them. To parse files from the server's file system (e.g. on a local MCP server), set the system property `lucee.mcp.ast.allowpath` or the environment variable `LUCEE_MCP_AST_ALLOWPATH` to `true`. Without it, `path` is not listed in the tools' input schema and calls that pass it return an error.
 
 - `parse_cfml_ast` — full tree JSON, or set `summary: true` for a compact overview; optional `maxDepth` limits nesting
 - `query_cfml_ast` — filter with `nodeType` (e.g. `CallExpression`, `CFMLTag`), `name`, `line`, or `builtInOnly: true`

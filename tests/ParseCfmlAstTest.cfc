@@ -22,6 +22,25 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="mcpserver" {
         variables.tool = createObject( "component", "org.lucee.extension.mcp.tools.ParseCfmlAst" );
         variables.tool.init();
         variables.astSupported = structKeyExists( getFunctionList(), "astFromString" );
+        variables.system = createObject( "java", "java.lang.System" );
+        variables.allowPathProp = "lucee.mcp.ast.allowpath";
+        variables.allowPathOrg = system.getProperty( allowPathProp );
+        variables.astFile = getTempFile( getTempDirectory(), "mcp-ast-test", "cfm" );
+        fileWrite( astFile, '<cfset x = 1>' );
+    }
+
+    function afterAll() {
+        restoreAllowPath();
+        if ( fileExists( astFile ) ) fileDelete( astFile );
+    }
+
+    private function restoreAllowPath() {
+        if ( isNull( allowPathOrg ) ) system.clearProperty( allowPathProp );
+        else system.setProperty( allowPathProp, allowPathOrg );
+    }
+
+    private function newTool() {
+        return createObject( "component", "org.lucee.extension.mcp.tools.ParseCfmlAst" ).init();
     }
 
     function run( testResults, testBox ) {
@@ -40,9 +59,61 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="mcpserver" {
                 var schema = tool.getInputSchema();
                 expect( schema.type ).toBe( "object" );
                 expect( structKeyExists( schema.properties, "source" ) ).toBeTrue();
-                expect( structKeyExists( schema.properties, "path" ) ).toBeTrue();
                 expect( structKeyExists( schema.properties, "mode" ) ).toBeTrue();
                 expect( structKeyExists( schema.properties, "summary" ) ).toBeTrue();
+            });
+
+            it( "path argument is disabled by default", function() {
+                system.clearProperty( allowPathProp );
+                try {
+                    var t = newTool();
+                    var env = system.getenv( "LUCEE_MCP_AST_ALLOWPATH" ) ?: "";
+                    var enabledByEnv = isBoolean( env ) && env;
+                    expect( structKeyExists( t.getInputSchema().properties, "path" ) ).toBe( enabledByEnv );
+                    if ( !enabledByEnv ) {
+                        expect( function() {
+                            t.exec( { path: astFile } );
+                        } ).toThrow( regex: "path argument is not enabled" );
+                    }
+                }
+                finally {
+                    restoreAllowPath();
+                }
+            });
+
+            it( "path argument is rejected when disabled", function() {
+                system.setProperty( allowPathProp, "false" );
+                try {
+                    var t = newTool();
+                    expect( structKeyExists( t.getInputSchema().properties, "path" ) ).toBeFalse();
+                    expect( function() {
+                        t.exec( { path: astFile } );
+                    } ).toThrow( regex: "path argument is not enabled" );
+                    // source still works
+                    if ( astSupported ) {
+                        var ast = deserializeJSON( t.exec( { source: '<cfset x = 1>' } ).content[1].text );
+                        expect( ast.type ).toBe( "Program" );
+                    }
+                }
+                finally {
+                    restoreAllowPath();
+                }
+            });
+
+            it( "path argument works when enabled", function() {
+                system.setProperty( allowPathProp, "true" );
+                try {
+                    var t = newTool();
+                    expect( structKeyExists( t.getInputSchema().properties, "path" ) ).toBeTrue();
+                    if ( astSupported ) {
+                        var ast = deserializeJSON( t.exec( { path: astFile } ).content[1].text );
+                        expect( ast.type ).toBe( "Program" );
+                        expect( arrayLen( ast.body ) ).toBeGT( 0 );
+                    }
+                }
+                finally {
+                    restoreAllowPath();
+                }
             });
 
             it( "missing source and path returns error", function() {
