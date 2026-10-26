@@ -39,6 +39,13 @@ Typical workflow: parse with `parse_cfml_ast` (often with `summary: true`), then
 
 `search_lucee_docs` indexes Lucee documentation via the Lucene 3 extension (`EFDEB172-F52E-4D84-9CD1A1F561B3DFC8`). Install Lucene on the same Lucee instance, or the tool still appears in `tools/list` but responds with *"Search is not available: Lucene 3 extension is not installed."*
 
+The index is stored on disk (`{lucee-config-dir}/doc/search`) and built on the first search. After that, the sources (functions, tags, and the recipe index) are only checked for changes once per cache TTL, and a source is only re-indexed (recipes only downloaded again) when it changed. When the TTL has expired, the check runs in the background and searches keep using the existing index. If the recipe source can't be reached, the recipes already indexed are kept and the check is retried after at most 5 minutes.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| system property `lucee.mcp.search.ttl` / environment variable `LUCEE_MCP_SEARCH_TTL` | `3600` | Seconds between checks of the documentation sources. `0` checks them on every search call |
+| environment variable `LUCEE_DOC_RECIPES_PATH` | the `lucee-docs` repository on GitHub | Base URL of the recipes (`/docs/recipes/index.json`) |
+
 ### Adding Your Own Tools
 
 Tools are loaded dynamically from the `tools/` folder. There are two places to add a tool depending on your use case:

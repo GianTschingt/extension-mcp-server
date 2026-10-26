@@ -6,6 +6,13 @@
  *
  * Requires the Lucee Lucene 3 extension (EFDEB172-F52E-4D84-9CD1A1F561B3DFC8).
  * If the extension is not installed the tool returns a graceful message.
+ *
+ * The search index is kept on disk and only checked for changes once per cache TTL
+ * (default 3600 seconds). Configure the TTL in seconds with the system property
+ * "lucee.mcp.search.ttl" or the environment variable "LUCEE_MCP_SEARCH_TTL";
+ * 0 checks the sources on every call. When the TTL expires and an index already exists,
+ * the check runs in a background thread and searches keep using the existing index.
+ * If the recipe source can't be reached, the recipes already indexed are kept.
  */
 component extends="Tool" {
 
@@ -34,6 +41,12 @@ component extends="Tool" {
 	static.LUCENE_EXT_ID   = "EFDEB172-F52E-4D84-9CD1A1F561B3DFC8";
 	static.COLLECTION_NAME = "luceeai";
 
+	// index cache
+	static.DEFAULT_TTL     = 3600; // seconds
+	static.RETRY_AFTER     = 300;  // seconds, max. wait before a failed source check is retried
+	static.STATE_KEY       = "luceeMcpSearchIndexState";
+	static.LOCK_NAME       = "lucee-mcp-search-index";
+
 	// -------------------------------------------------------------------------
 
 	public function exec( required struct args ) {
@@ -49,7 +62,7 @@ component extends="Tool" {
 		var maxResults = min( val( args.maxResults ?: 3 ), 10 );
 		if ( maxResults < 1 ) maxResults = 3;
 
-		createIndex();
+		ensureIndex();
 
 		// Escape Lucene special characters
 		var safeQuery = reReplace( query, "([+\-&|!(){}[\]^""~*?:\\/])", "\\\1", "ALL" );
@@ -103,44 +116,145 @@ component extends="Tool" {
 	// Index management
 	// -------------------------------------------------------------------------
 
-	private function createIndex() {
-		createCollection();
+	/**
+	 * makes sure the index exists and was checked against its sources within the cache TTL
+	 */
+	private function ensureIndex() {
+		var ttl   = getCacheTTL();
+		var state = getIndexState();
 
-		// Load all data sources
-		var sources = [
-			getFunctionIndexData(),
-			getTagIndexData(),
-			getRecipeIndexData()
-		];
+		// fresh enough, nothing to do
+		if ( ttl > 0 && state.indexed && now() < state.nextCheck ) return;
 
-		cfindex( action="list", name="local.existing", collection=static.COLLECTION_NAME );
+		// an index exists: check the sources in the background and use the existing index for this call
+		if ( ttl > 0 && state.indexed ) {
+			refreshInBackground();
+			return;
+		}
 
-		loop array=sources item="local.src" {
-			var indexHash = "hash:#src['hash']#";
-			var alreadyIndexed = false;
+		// no index yet (or caching disabled): build it now
+		lock name=static.LOCK_NAME type="exclusive" timeout=120 {
+			state = getIndexState();
+			if ( ttl > 0 && state.indexed && now() < state.nextCheck ) return;
+			refreshIndex( ttl );
+		}
+	}
 
-			loop query=existing {
-				if ( existing.custom4 == indexHash ) {
-					alreadyIndexed = true;
-					break;
+	private function refreshInBackground() {
+		var state = getIndexState();
+		if ( state.refreshing ) return;
+		state.refreshing = true;
+		try {
+			thread name="mcp-search-index-#createUUID()#" action="run" {
+				try {
+					lock name=static.LOCK_NAME type="exclusive" timeout=1 throwOnTimeout=false {
+						// another request may have refreshed the index in the meantime
+						if ( now() >= getIndexState().nextCheck ) {
+							refreshIndex( getCacheTTL() );
+						}
+					}
+				}
+				catch ( any e ) {
+					log text="search_lucee_docs: background index refresh failed: #e.message#" type="error" log="application";
+				}
+				finally {
+					getIndexState().refreshing = false;
 				}
 			}
+		}
+		catch ( any e ) {
+			state.refreshing = false;
+			rethrow;
+		}
+	}
 
-			if ( !alreadyIndexed ) {
-				cfindex(
-					action     = "update"
-					type       = "custom"
-					collection = static.COLLECTION_NAME
-					key        = "url"
-					title      = "title"
-					body       = src.bodyColumns
-					custom1    = "keywords"
-					custom2    = "url"
-					custom4    = indexHash
-					query      = src.name
-				);
+	/**
+	 * checks all sources and (re)indexes the ones that changed, must run inside the index lock
+	 */
+	private function refreshIndex( required numeric ttl ) {
+		var complete = createIndex();
+		var state    = getIndexState();
+		state.indexed = true;
+		state.lastCheck = now();
+		// if a source could not be reached, check again sooner than the TTL
+		var wait = complete ? arguments.ttl : min( arguments.ttl, static.RETRY_AFTER );
+		state.nextCheck = dateAdd( "s", wait, state.lastCheck );
+	}
+
+	/**
+	 * returns the shared index state (server scope, the collection is shared by the whole server)
+	 */
+	public struct function getIndexState() {
+		if ( !structKeyExists( server, static.STATE_KEY ) ) {
+			lock name="#static.LOCK_NAME#-state" type="exclusive" timeout=5 {
+				if ( !structKeyExists( server, static.STATE_KEY ) ) {
+					server[ static.STATE_KEY ] = {
+						"indexed"   : false,
+						"refreshing": false,
+						"lastCheck" : "",
+						"nextCheck" : now()
+					};
+				}
 			}
 		}
+		return server[ static.STATE_KEY ];
+	}
+
+	/**
+	 * cache TTL in seconds: system property "lucee.mcp.search.ttl", environment variable
+	 * "LUCEE_MCP_SEARCH_TTL", default 3600. 0 disables the cache.
+	 */
+	public numeric function getCacheTTL() {
+		var sys = createObject( "java", "java.lang.System" );
+		var raw = sys.getProperty( "lucee.mcp.search.ttl" )
+		       ?: sys.getenv( "LUCEE_MCP_SEARCH_TTL" )
+		       ?: "";
+		raw = trim( raw );
+		if ( !len( raw ) || !isNumeric( raw ) || raw < 0 ) return static.DEFAULT_TTL;
+		return int( raw );
+	}
+
+	/**
+	 * indexes every source whose hash is not in the collection yet
+	 * returns false if a source could not be loaded (what is already indexed for it is kept)
+	 */
+	private boolean function createIndex() {
+		createCollection();
+
+		cfindex( action="list", name="local.existing", collection=static.COLLECTION_NAME );
+		var indexed = {};
+		loop query=existing {
+			indexed[ existing.custom4 ] = true;
+		}
+
+		var complete = true;
+		// the hash of each source is checked before its data is loaded,
+		// so unchanged sources are not rebuilt or downloaded again
+		loop array=[ "function", "tag", "recipe" ] item="local.type" {
+			var src = type == "function" ? getFunctionIndexData( indexed )
+			        : type == "tag"      ? getTagIndexData( indexed )
+			        :                      getRecipeIndexData( indexed );
+
+			if ( !src.loaded ) {
+				complete = false;
+				continue;
+			}
+			if ( src.upToDate ) continue;
+
+			cfindex(
+				action     = "update"
+				type       = "custom"
+				collection = static.COLLECTION_NAME
+				key        = "url"
+				title      = "title"
+				body       = src.bodyColumns
+				custom1    = "keywords"
+				custom2    = "url"
+				custom4    = "hash:#src['hash']#"
+				query      = src.name
+			);
+		}
+		return complete;
 	}
 
 	private function createCollection() {
@@ -164,13 +278,27 @@ component extends="Tool" {
 	}
 
 	// -------------------------------------------------------------------------
-	// Data loaders - return struct with keys: name, hash, bodyColumns, + query variable
+	// Data loaders - return struct with keys: name, hash, bodyColumns, loaded, upToDate + query variable
+	// the query is only built when the hash of the source is not indexed yet
 	// -------------------------------------------------------------------------
 
-	private function getFunctionIndexData() {
+	private function getFunctionIndexData( required struct indexed ) {
+		var functions = getFunctionList();
+		var result = {
+			"name"       : "function",
+			"hash"       : hash( structCount( functions ), "quick" ),
+			"bodyColumns": "body",
+			"loaded"     : true,
+			"upToDate"   : false
+		};
+		if ( structKeyExists( indexed, "hash:#result.hash#" ) ) {
+			result.upToDate = true;
+			return result;
+		}
+
 		var qry = queryNew( [ "title", "body", "url", "keywords" ] );
 
-		loop array=structKeyArray( getFunctionList() ) item="local.fnName" {
+		loop array=structKeyArray( functions ) item="local.fnName" {
 			var data = getFunctionData( fnName );
 			var row  = queryAddRow( qry );
 			var body = trim( "
@@ -191,17 +319,30 @@ documentation: https://docs.lucee.org/reference/functions/#fnName#.html
 		}
 
 		variables.function = qry;
-		return {
-			"name"       : "function",
-			"hash"       : hash( qry.recordCount, "quick" ),
-			"bodyColumns": "body"
-		};
+		return result;
 	}
 
-	private function getTagIndexData() {
+	private function getTagIndexData( required struct indexed ) {
+		var tagList = getTagList();
+		var count   = 0;
+		loop struct=tagList index="local.prefix" item="local.tags" {
+			count += structCount( tags );
+		}
+		var result = {
+			"name"       : "tag",
+			"hash"       : hash( count, "quick" ),
+			"bodyColumns": "body",
+			"loaded"     : true,
+			"upToDate"   : false
+		};
+		if ( structKeyExists( indexed, "hash:#result.hash#" ) ) {
+			result.upToDate = true;
+			return result;
+		}
+
 		var qry = queryNew( [ "title", "body", "url", "keywords" ] );
 
-		loop struct=getTagList() index="local.prefix" item="local.tags" {
+		loop struct=tagList index="local.prefix" item="local.tags" {
 			loop array=structKeyArray( tags ) item="local.tagName" {
 				var data = getTagData( prefix, tagName );
 				var row  = queryAddRow( qry );
@@ -224,26 +365,41 @@ documentation: https://docs.lucee.org/reference/tags/#tagName#.html
 		}
 
 		variables.tag = qry;
-		return {
-			"name"       : "tag",
-			"hash"       : hash( qry.recordCount, "quick" ),
-			"bodyColumns": "body"
-		};
+		return result;
 	}
 
-	private function getRecipeIndexData() {
+	private function getRecipeIndexData( required struct indexed ) {
 		var rootPath = server.system.environment.LUCEE_DOC_RECIPES_PATH
 		             ?: "https://raw.githubusercontent.com/lucee/lucee-docs/master";
 
-		// fetch remote index
-		http url="#rootPath#/docs/recipes/index.json" timeout=10 result="local.res";
-		if ( res.status_code < 200 || res.status_code >= 300 ) {
-			// nothing to index
-			variables.recipe = queryNew( [ "title", "content", "url", "keywords" ] );
-			return { "name": "recipe", "hash": "empty", "bodyColumns": "content,keywords" };
+		var result = {
+			"name"       : "recipe",
+			"hash"       : "",
+			"bodyColumns": "content,keywords",
+			"loaded"     : false,
+			"upToDate"   : false
+		};
+
+		// fetch remote index, if it can't be loaded the recipes already indexed are kept
+		try {
+			http url="#rootPath#/docs/recipes/index.json" timeout=10 result="local.res";
+			if ( val( res.status_code ) < 200 || val( res.status_code ) >= 300 ) {
+				log text="search_lucee_docs: recipe index not available (status #res.status_code#), keeping the recipes already indexed" type="warning" log="application";
+				return result;
+			}
+			var index = deserializeJSON( res.filecontent );
+		}
+		catch ( any e ) {
+			log text="search_lucee_docs: recipe index not available (#e.message#), keeping the recipes already indexed" type="warning" log="application";
+			return result;
+		}
+		result.loaded = true;
+		result.hash   = hash( res.filecontent, "md5" );
+		if ( structKeyExists( indexed, "hash:#result.hash#" ) ) {
+			result.upToDate = true;
+			return result;
 		}
 
-		var index = deserializeJSON( res.filecontent );
 		var qry   = queryNew( [ "title", "content", "url", "keywords" ] );
 
 		loop array=index item="local.entry" {
@@ -277,11 +433,7 @@ documentation: https://docs.lucee.org/reference/tags/#tagName#.html
 		}
 
 		variables.recipe = qry;
-		return {
-			"name"       : "recipe",
-			"hash"       : hash( res.filecontent, "md5" ),
-			"bodyColumns": "content,keywords"
-		};
+		return result;
 	}
 
 }
