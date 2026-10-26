@@ -20,9 +20,29 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="mcpserver" {
 
     function beforeAll() {
         variables.tool = new org.lucee.extension.mcp.tools.SearchLuceeDocs();
+        variables.system = createObject( "java", "java.lang.System" );
+        variables.ttlProp = "lucee.mcp.search.ttl";
+        variables.ttlOrg = system.getProperty( ttlProp );
+        variables.searchSupported = extensionExists( "EFDEB172-F52E-4D84-9CD1A1F561B3DFC8" )
+            && listFirst( extensionInfo( "EFDEB172-F52E-4D84-9CD1A1F561B3DFC8" ).version, "." ) >= 3;
     }
 
     function afterAll() {
+        restoreTTL();
+    }
+
+    // waits until a background refresh started by an earlier call is finished
+    private function waitForBackgroundRefresh() {
+        var started = getTickCount();
+        while ( tool.getIndexState().refreshing ) {
+            if ( getTickCount() - started > 120000 ) throw( message: "background index refresh did not finish within 120 seconds" );
+            sleep( 100 );
+        }
+    }
+
+    private function restoreTTL() {
+        if ( isNull( ttlOrg ) ) system.clearProperty( ttlProp );
+        else system.setProperty( ttlProp, ttlOrg );
     }
 
     function run( testResults, testBox ) {
@@ -87,6 +107,92 @@ component extends="org.lucee.cfml.test.LuceeTestCase" labels="mcpserver" {
                 // both return content — we can't assert exact counts from the text
                 // but we can assert the larger request returns more or equal text
                 expect( len( result3.content[1].text ) >= len( result1.content[1].text ) ).toBeTrue();
+            });
+
+            it( "cache TTL is configurable with a system property", function() {
+                try {
+                    system.setProperty( ttlProp, "120" );
+                    expect( tool.getCacheTTL() ).toBe( 120 );
+                    system.setProperty( ttlProp, "0" );
+                    expect( tool.getCacheTTL() ).toBe( 0 );
+                    // invalid values fall back to the default
+                    system.setProperty( ttlProp, "abc" );
+                    expect( tool.getCacheTTL() ).toBe( 3600 );
+                    system.setProperty( ttlProp, "-5" );
+                    expect( tool.getCacheTTL() ).toBe( 3600 );
+                }
+                finally {
+                    restoreTTL();
+                }
+            });
+
+            it( "cache TTL defaults to 3600 seconds", function() {
+                if ( len( system.getenv( "LUCEE_MCP_SEARCH_TTL" ) ?: "" ) ) return;
+                try {
+                    system.clearProperty( ttlProp );
+                    expect( tool.getCacheTTL() ).toBe( 3600 );
+                }
+                finally {
+                    restoreTTL();
+                }
+            });
+
+            it( "index is not checked again within the cache TTL", function() {
+                if ( !searchSupported ) return;
+                try {
+                    system.setProperty( ttlProp, "3600" );
+                    tool.exec( { query: "arraySort" } );
+                    waitForBackgroundRefresh();
+                    var state = tool.getIndexState();
+                    expect( state.indexed ).toBeTrue();
+                    expect( state.nextCheck ).toBeGT( now() );
+                    var lastCheck = state.lastCheck;
+
+                    sleep( 1100 );
+                    tool.exec( { query: "arrayEach" } );
+                    expect( tool.getIndexState().lastCheck ).toBe( lastCheck );
+                }
+                finally {
+                    restoreTTL();
+                }
+            });
+
+            it( "index is checked on every call with TTL 0", function() {
+                if ( !searchSupported ) return;
+                try {
+                    system.setProperty( ttlProp, "0" );
+                    waitForBackgroundRefresh();
+                    tool.exec( { query: "arraySort" } );
+                    var lastCheck = tool.getIndexState().lastCheck;
+
+                    sleep( 1100 );
+                    tool.exec( { query: "arrayEach" } );
+                    expect( tool.getIndexState().lastCheck ).toBeGT( lastCheck );
+                }
+                finally {
+                    restoreTTL();
+                }
+            });
+
+            it( "expired index is refreshed in the background", function() {
+                if ( !searchSupported ) return;
+                try {
+                    system.setProperty( ttlProp, "1" );
+                    waitForBackgroundRefresh();
+                    tool.exec( { query: "arraySort" } );
+                    waitForBackgroundRefresh();
+                    var lastCheck = tool.getIndexState().lastCheck;
+
+                    sleep( 1100 );
+                    // served from the existing index while the refresh runs in the background
+                    var result = tool.exec( { query: "arraySort" } );
+                    expect( findNoCase( "arraySort", result.content[1].text ) > 0 ).toBeTrue();
+                    waitForBackgroundRefresh();
+                    expect( tool.getIndexState().lastCheck ).toBeGT( lastCheck );
+                }
+                finally {
+                    restoreTTL();
+                }
             });
 
             it( "no results returns graceful not-found content", function() {
